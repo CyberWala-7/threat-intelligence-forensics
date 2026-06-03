@@ -1,255 +1,85 @@
-"""
-CVE Analyzer Module
-Analyzes CVEs and vulnerabilities from public feeds
-"""
-
-import requests
-import logging
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
+from config import settings, logger
+from src.models import CVE, Severity
 from datetime import datetime, timedelta
-import config
-
-logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
-logger = logging.getLogger(__name__)
-
+from typing import List, Optional
 
 class CVEAnalyzer:
-    """
-    Analyzes Common Vulnerabilities and Exposures (CVEs)
-    """
-    
     def __init__(self):
-        self.cve_database = {}
+        self.api_key = settings.nvd_api_key
+        self.base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+        self.client = httpx.AsyncClient(timeout=settings.api_timeout)
         self.cve_history = []
         logger.info("CVEAnalyzer initialized")
     
-    def get_latest_cves(self, days=7, severity='HIGH'):
-        """
-        Get latest CVEs from NVD
-        
-        Args:
-            days (int): Number of days to look back
-            severity (str): Minimum severity level (LOW, MEDIUM, HIGH, CRITICAL)
-            
-        Returns:
-            list: List of recent CVEs
-        """
-        cves = []
-        start_date = (datetime.now() - timedelta(days=days)).isoformat()
-        
+    @retry(stop=stop_after_attempt(settings.max_retries))
+    async def check_product_vulnerabilities(self, product_name: str, version: Optional[str] = None) -> List[CVE]:
+        params = {"keywordSearch": product_name, "resultsPerPage": 20}
+        if version:
+            params["keywordSearch"] += f" {version}"
         try:
-            url = f'{config.NVD_API_URL}/cves/1.0'
-            params = {
-                'pubStartDate': start_date,
-                'resultsPerPage': 100
-            }
-            
-            response = requests.get(url, params=params, timeout=config.REQUEST_TIMEOUT)
-            
+            response = await self.client.get(self.base_url, params=params)
             if response.status_code == 200:
                 data = response.json()
-                
-                for result in data.get('result', {}).get('CVE_Items', []):
-                    cve_id = result.get('cve', {}).get('CVE_data_meta', {}).get('ID')
-                    severity_score = self._extract_severity(result)
-                    
-                    if severity_score and self._meets_severity_threshold(severity_score, severity):
-                        cve = {
-                            'cve_id': cve_id,
-                            'severity': severity_score,
-                            'published_date': result.get('publishedDate'),
-                            'description': self._extract_description(result),
-                            'cvss_score': self._extract_cvss_score(result),
-                            'affected_products': self._extract_affected_products(result)
-                        }
-                        
-                        cves.append(cve)
-                        self.cve_database[cve_id] = cve
-                        self.cve_history.append(cve)
-            
-            logger.info(f"Retrieved {len(cves)} CVEs from NVD")
-        
-        except Exception as e:
-            logger.error(f"Error fetching CVEs: {str(e)}")
-        
-        return cves
-    
-    def check_cve(self, cve_id):
-        """
-        Get detailed information about a specific CVE
-        
-        Args:
-            cve_id (str): CVE ID (e.g., CVE-2021-44228)
-            
-        Returns:
-            dict: CVE details
-        """
-        if cve_id in self.cve_database:
-            return self.cve_database[cve_id]
-        
-        try:
-            url = f'{config.NVD_API_URL}/cves/1.0/{cve_id}'
-            response = requests.get(url, timeout=config.REQUEST_TIMEOUT)
-            
-            if response.status_code == 200:
-                result = response.json().get('result', {}).get('CVE_Items', [{}])[0]
-                
-                cve = {
-                    'cve_id': cve_id,
-                    'severity': self._extract_severity(result),
-                    'published_date': result.get('publishedDate'),
-                    'description': self._extract_description(result),
-                    'cvss_score': self._extract_cvss_score(result),
-                    'affected_products': self._extract_affected_products(result),
-                    'references': self._extract_references(result)
-                }
-                
-                self.cve_database[cve_id] = cve
-                return cve
-        
-        except Exception as e:
-            logger.error(f"Error fetching CVE {cve_id}: {str(e)}")
-        
-        return None
-    
-    def check_product_vulnerabilities(self, product_name, version=None):
-        """
-        Check vulnerabilities for a specific product
-        
-        Args:
-            product_name (str): Product name (e.g., 'apache')
-            version (str, optional): Product version
-            
-        Returns:
-            list: List of applicable CVEs
-        """
-        vulnerabilities = []
-        
-        try:
-            url = f'{config.NVD_API_URL}/cpes/1.0'
-            params = {
-                'keyword': product_name,
-                'resultsPerPage': 50
-            }
-            
-            response = requests.get(url, params=params, timeout=config.REQUEST_TIMEOUT)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                for result in data.get('result', {}).get('cpes', []):
-                    cpe = result.get('cpe23Uri')
-                    
-                    if version is None or version in cpe:
-                        # Get CVEs for this CPE
-                        cve_match = self._get_cves_for_cpe(cpe)
-                        vulnerabilities.extend(cve_match)
-        
-        except Exception as e:
-            logger.error(f"Error checking product vulnerabilities: {str(e)}")
-        
-        return vulnerabilities
-    
-    def _extract_severity(self, cve_item):
-        """Extract severity from CVE item"""
-        impact = cve_item.get('impact', {})
-        cvss_v3 = impact.get('baseMetricV3', {})
-        cvss_v2 = impact.get('baseMetricV2', {})
-        
-        if cvss_v3:
-            return cvss_v3.get('cvssV3', {}).get('baseSeverity', 'UNKNOWN')
-        elif cvss_v2:
-            return self._convert_cvss_v2_severity(cvss_v2.get('severity', 'UNKNOWN'))
-        
-        return 'UNKNOWN'
-    
-    def _convert_cvss_v2_severity(self, severity_score):
-        """Convert CVSS v2 score to severity level"""
-        try:
-            score = float(severity_score)
-            if score >= 9.0:
-                return 'CRITICAL'
-            elif score >= 7.0:
-                return 'HIGH'
-            elif score >= 4.0:
-                return 'MEDIUM'
+                cves = []
+                for vuln in data.get("vulnerabilities", []):
+                    cve_data = vuln["cve"]
+                    metrics = cve_data.get("metrics", {})
+                    cvss_v3 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
+                    severity_str = cvss_v3.get("baseSeverity", "MEDIUM")
+                    try:
+                        severity = Severity[severity_str.upper()]
+                    except KeyError:
+                        severity = Severity.MEDIUM
+                    cve = CVE(
+                        id=cve_data["id"],
+                        severity=severity,
+                        cvss_score=cvss_v3.get("baseScore"),
+                        description=cve_data["descriptions"][0]["value"],
+                        published_date=datetime.fromisoformat(cve_data["published"].replace("Z", "+00:00")),
+                        product=product_name,
+                        version=version
+                    )
+                    cves.append(cve)
+                self.cve_history.extend(cves)
+                return cves
             else:
-                return 'LOW'
-        except:
-            return 'UNKNOWN'
+                return []
+        except Exception as e:
+            logger.error(f"CVE check failed: {e}")
+            return []
     
-    def _extract_description(self, cve_item):
-        """Extract description from CVE item"""
-        return cve_item.get('cve', {}).get('description', {}).get('description_data', [{}])[0].get('value', '')
+    async def get_latest_cves(self, days: int = 7, severity: str = "HIGH") -> List[CVE]:
+        pub_start_date = (datetime.now() - timedelta(days=days)).isoformat() + "Z"
+        params = {"pubStartDate": pub_start_date, "resultsPerPage": 50}
+        try:
+            response = await self.client.get(self.base_url, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                cves = []
+                for vuln in data.get("vulnerabilities", []):
+                    cve_data = vuln["cve"]
+                    metrics = cve_data.get("metrics", {})
+                    cvss_v3 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
+                    sev = cvss_v3.get("baseSeverity", "LOW")
+                    try:
+                        severity_enum = Severity[sev.upper()]
+                    except KeyError:
+                        severity_enum = Severity.LOW
+                    if severity_enum.value >= Severity[severity.upper()].value:
+                        cves.append(CVE(
+                            id=cve_data["id"],
+                            severity=severity_enum,
+                            cvss_score=cvss_v3.get("baseScore"),
+                            description=cve_data["descriptions"][0]["value"],
+                            published_date=datetime.fromisoformat(cve_data["published"].replace("Z", "+00:00"))
+                        ))
+                return cves
+            return []
+        except Exception as e:
+            logger.error(f"Latest CVEs fetch failed: {e}")
+            return []
     
-    def _extract_cvss_score(self, cve_item):
-        """Extract CVSS score"""
-        impact = cve_item.get('impact', {})
-        cvss_v3 = impact.get('baseMetricV3', {})
-        
-        if cvss_v3:
-            return cvss_v3.get('cvssV3', {}).get('baseScore')
-        
-        cvss_v2 = impact.get('baseMetricV2', {})
-        if cvss_v2:
-            return cvss_v2.get('cvssV2', {}).get('baseScore')
-        
-        return None
-    
-    def _extract_affected_products(self, cve_item):
-        """Extract affected products"""
-        products = []
-        
-        for config_item in cve_item.get('configurations', {}).get('nodes', []):
-            for cpe_match in config_item.get('cpe_match', []):
-                products.append(cpe_match.get('cpe23Uri'))
-        
-        return list(set(products))
-    
-    def _extract_references(self, cve_item):
-        """Extract reference URLs"""
-        references = []
-        
-        for ref in cve_item.get('cve', {}).get('references', {}).get('reference_data', []):
-            references.append(ref.get('url'))
-        
-        return references
-    
-    def _meets_severity_threshold(self, severity, threshold):
-        """Check if severity meets threshold"""
-        severity_levels = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3, 'CRITICAL': 4}
-        threshold_levels = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3, 'CRITICAL': 4}
-        
-        return severity_levels.get(severity, 0) >= threshold_levels.get(threshold, 0)
-    
-    def _get_cves_for_cpe(self, cpe):
-        """Get CVEs for a specific CPE (placeholder)"""
-        # This would integrate with NVD API to get CVEs for CPE
-        return []
-    
-    def generate_vulnerability_report(self, output_file=None):
-        """
-        Generate vulnerability report
-        
-        Args:
-            output_file (str, optional): File to save report
-            
-        Returns:
-            dict: Report summary
-        """
-        critical_count = sum(1 for cve in self.cve_history if cve.get('severity') == 'CRITICAL')
-        high_count = sum(1 for cve in self.cve_history if cve.get('severity') == 'HIGH')
-        
-        report = {
-            'total_cves': len(self.cve_history),
-            'critical_cves': critical_count,
-            'high_cves': high_count,
-            'cve_list': self.cve_history
-        }
-        
-        if output_file:
-            import json
-            with open(output_file, 'w') as f:
-                json.dump(report, f, indent=4, default=str)
-            logger.info(f"Vulnerability report saved to {output_file}")
-        
-        return report
+    async def close(self):
+        await self.client.aclose()
